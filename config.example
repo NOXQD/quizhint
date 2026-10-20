@@ -1,0 +1,88 @@
+# quizhint — скопируйте в ~/.config/quizhint/config и выполните chmod 600:
+# в файле лежит ключ API.
+# Формат: ключ = значение. Строки, начинающиеся с #, — комментарии.
+
+# --- Модель -------------------------------------------------------------
+
+# anthropic — Claude (ключ: https://console.anthropic.com)
+# gemini    — Google Gemini (ключ: https://aistudio.google.com/apikey)
+# openai    — любой OpenAI-совместимый API: OpenAI, OpenRouter, Groq, Ollama…
+provider = anthropic
+
+# Пусто — модель по умолчанию: claude-haiku-5-5 для Claude, gemini-flash-latest
+# (всегда свежая Flash-модель) для Gemini. Для provider = openai модель обязательна.
+# Если ответы неточные, попробуйте claude-sonnet-5-5 или gemini-3.8-flash.
+#model =
+
+# Ключ API. Можно задать отдельный ключ для каждого провайдера — тогда при смене
+# провайдера не придётся вводить его заново (плагин Omarchy так и делает).
+# Вместо файла можно задать ANTHROPIC_API_KEY / GEMINI_API_KEY / OPENAI_API_KEY.
+api_key =
+#anthropic_api_key =
+#gemini_api_key =
+#openai_api_key =
+
+# Адрес API; по умолчанию — официальный адрес провайдера. Для provider = openai, например:
+#   OpenAI:      base_url = https://api.openai.com/v1
+#   OpenRouter:  base_url = https://openrouter.ai/api/v1
+#   Ollama:      base_url = http://localhost:11434/v1   (ключ не нужен, модель с поддержкой картинок)
+#base_url =
+
+# Уровень рассуждений: minimal, low, medium или high. Чем ниже, тем быстрее ответ.
+# Для Gemini по умолчанию low; для openai уходит как reasoning_effort, только если задан.
+#thinking = low
+
+# Лимит токенов ответа. Для anthropic по умолчанию 16; для остальных отправляется,
+# только если задан (рассуждения тоже расходуют этот лимит).
+#max_tokens = 16
+
+# Температура. По умолчанию не отправляется.
+#temperature = 0
+
+# Дополнительные поля тела запроса (JSON-объект), например:
+#extra = {"top_p": 1}
+
+# Таймаут запроса, секунды.
+timeout = 30
+
+# Свой системный промпт вместо встроенного («ответь только номером варианта»).
+# В кавычках можно использовать \n.
+#prompt = "..."
+
+# --- Снимок экрана ------------------------------------------------------
+
+# monitor — весь активный монитор; window — только активное окно
+# (меньше картинка, быстрее отправка, модель не отвлекается на остальное).
+capture = monitor
+
+# auto — ext-image-copy-capture, при сбое wlr-screencopy; или явно ext / wlr.
+capture_protocol = auto
+
+# Длинная сторона картинки в пикселях (0 — не уменьшать) и качество JPEG.
+max_size = 1568
+jpeg_quality = 80
+
+# --- Цифра на экране ----------------------------------------------------
+
+font = sans-serif
+font_size = 15
+# #rrggbb или #rrggbbaa
+color = #ffffff
+background = #000000cc
+margin_top = 6
+margin_left = 6
+# true — в самом углу поверх панели, false — сразу под панелью.
+over_panels = false
+# Через сколько секунд спрятать цифру (0 — держать до следующего запроса).
+hide_after = 5
+# Точка, пока модель думает.
+busy_indicator = true
+
+# --- Плагин Omarchy -----------------------------------------------------
+# Эти параметры читает плагин для панели Omarchy, сама программа их не использует.
+
+# Горячая клавиша в синтаксисе Hyprland: F1, CTRL + SHIFT + Q… (пусто — без клавиши).
+# Экран снимается только по ней — больше ничто снимок не запускает.
+hotkey = F1
+# Запускать quizhint вместе с панелью (переключатель в плагине меняет это значение).
+autostart = true

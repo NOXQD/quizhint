@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "noxqd.quizhint",
+  "name": "Quiz Hint",
+  "version": "1.2.1",
+  "author": "noxqd",
+  "license": "MIT",
+  "description": "Подсказка для викторин: по горячей клавише снимок экрана уходит vision-модели, а номер правильного ответа появляется в углу экрана.",
+  "kinds": ["service", "bar-widget"],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "keepLoaded": true,
+  "barWidget": {
+    "displayName": "Quiz Hint",
+    "description": "Включение quizhint, последний ответ и настройки модели.",
+    "category": "AI",
+    "aliases": ["quiz", "quizhint", "hint", "викторина", "подсказка"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
