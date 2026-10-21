@@ -22,7 +22,12 @@ struct Config {
     std::optional<double> temperature;
     std::string thinking;                // уровень рассуждений: minimal | low | medium | high, пусто — по умолчанию
     std::string extra;                   // JSON-объект, его поля добавляются в тело запроса
-    std::string prompt;                  // системный промпт; пусто — встроенный
+    std::string prompt;                  // системный промпт режима «цифра»; пусто — встроенный
+    std::string answer_mode = "number";  // number — номер варианта, full — короткий полный ответ
+    std::string full_length = "short";   // полный ответ: short | medium | long
+    bool full_explain = true;            // добавлять короткое пояснение к ответу
+    std::string answer_language = "auto";  // auto — язык вопроса, ru, en
+    std::string instructions;            // свои указания модели (добавляются к промпту)
     int timeout = 30;                    // секунды на весь запрос
 
     // Снимок экрана
@@ -36,14 +41,22 @@ struct Config {
     double font_size = 15;
     Rgba color{1, 1, 1, 1};
     Rgba background{0, 0, 0, 0.8};
-    int margin_top = 6;
-    int margin_left = 6;
+    std::string position = "top-left";  // угол экрана: top-left | top-right | bottom-left | bottom-right
+    int margin_x = 6;                   // отступ от угла по горизонтали
+    int margin_y = 6;                   // и по вертикали
     bool over_panels = false;  // true — в самом углу поверх панели, false — под ней
     double hide_after = 5;     // секунды, 0 — не прятать до следующего запроса
     bool busy_indicator = true;
 
+    // Полный ответ
+    double full_font_size = 13;
+    int full_width = 440;          // ширина плашки с текстом
+    int full_max_lines = 10;       // дальше — многоточие
+    double hide_after_full = 20;   // секунды, 0 — не прятать до следующего запроса
+
     // Для плагина Omarchy; сам quizhint их не использует.
     std::string hotkey = "F1";
+    std::string region_hotkey = "F3";  // выделить область экрана
     bool autostart = true;
 
     // Откуда взят ключ: "config", имя переменной окружения или "" (ключа нет).

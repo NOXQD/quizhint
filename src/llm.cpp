@@ -5,24 +5,89 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <optional>
 
 namespace llm {
 
 namespace {
 
-constexpr const char* kSystemPrompt =
-    "You are given a screenshot that contains a quiz question (in any language) with several answer options. "
-    "Ignore everything else on the screen: browser UI, other windows, timers, scores.\n"
-    "Decide which option is correct and reply with its number. Number the options 1, 2, 3, ... in the order "
-    "they appear on the screen: from top to bottom, and if the options form a grid, from left to right within "
-    "each row before moving to the next row. If the options are labelled with letters (A, B, C, ... or "
-    "А, Б, В, ...), the first letter is 1, the second is 2, and so on.\n"
-    "Reply with the number only, without any other words, punctuation or explanation. If several options are "
-    "correct (a \"select all that apply\" question), reply with all of their numbers separated by commas, "
-    "for example: 1,3\n"
-    "If there is no question with answer options on the screenshot, reply 0.";
+constexpr const char* kScreenIntro = "You are given a screenshot of the user's screen.";
+constexpr const char* kRegionIntro =
+    "You are given a fragment of the screen that the user selected; it contains what needs to be answered.";
 
-constexpr const char* kUserPrompt = "Which option is correct?";
+constexpr const char* kNumbering =
+    "Number the options 1, 2, 3, ... in the order they appear: from top to bottom, and if the options form a "
+    "grid, from left to right within each row before moving to the next row. If the options are labelled with "
+    "letters (A, B, C, ... or А, Б, В, ...), the first letter is 1, the second is 2, and so on.";
+
+// Настройки полного ответа (длина, пояснение, язык, свои указания) — в текст промпта.
+size_t length_limit(const Config& cfg) {
+    return cfg.full_length == "long" ? 900 : cfg.full_length == "medium" ? 500 : 250;
+}
+
+std::string language_rule(const Config& cfg) {
+    if (cfg.answer_language == "ru") return "Always reply in Russian.";
+    if (cfg.answer_language == "en") return "Always reply in English.";
+    return "Reply in the language of the question.";
+}
+
+std::string style_rule(const Config& cfg) {
+    const std::string limit = std::to_string(length_limit(cfg));
+    if (!cfg.full_explain)
+        return "Give only the answer itself, without explanation or reasoning. Keep it under " + limit + " characters.";
+    if (cfg.full_length == "short")
+        return "Be brief but complete: state the final answer first, then add at most one short sentence of "
+               "explanation if it really helps. Keep the whole reply under " + limit + " characters. For a "
+               "calculation give the result, not the steps.";
+    return "State the final answer first, then explain it briefly: the key reasoning or steps in a few short "
+           "sentences. Keep the whole reply under " + limit + " characters.";
+}
+
+std::string user_rules(const Config& cfg) {
+    if (cfg.instructions.empty()) return {};
+    return "\nAdditional instructions from the user (follow them unless they conflict with the rules above): " +
+           cfg.instructions;
+}
+
+std::string system_prompt(const Config& cfg, Kind kind, bool region) {
+    const std::string intro = region ? kRegionIntro : kScreenIntro;
+    switch (kind) {
+    case Kind::Number:
+        if (!cfg.prompt.empty()) return cfg.prompt;
+        return intro +
+               " It contains a quiz question (in any language) with several answer options. Ignore everything "
+               "else: browser UI, other windows, timers, scores.\n"
+               "Decide which option is correct and reply with its number. " + kNumbering + "\n"
+               "Reply with the number only, without any other words, punctuation or explanation. If several "
+               "options are correct (a \"select all that apply\" question), reply with all of their numbers "
+               "separated by commas, for example: 1,3\n"
+               "If there is no question with answer options in the image, reply 0.";
+    case Kind::Full:
+        return intro +
+               " Find the question, task or problem in it - a quiz or test question, an exercise, a math or logic "
+               "problem, a question about code or anything else - and answer it. Ignore everything unrelated: "
+               "browser UI, other windows, timers, scores.\n" +
+               language_rule(cfg) + " " + style_rule(cfg) + "\n"
+               "If the question has answer options, start with the number of the correct option, then \" — \" and "
+               "the option text, for example: 2 — Paris. " + kNumbering +
+               " If several options are correct, give all of their numbers.\n"
+               "Plain text only: no markdown, no LaTeX, no lists.\n"
+               "If there is no question or task in the image, reply 0." + user_rules(cfg);
+    case Kind::Auto:
+        return intro +
+               " Find the question, task or problem in it and answer it. Ignore everything unrelated.\n"
+               "If the question has answer options, reply with the number of the correct option only, without any "
+               "other words. " + kNumbering + " If several options are correct, reply with all of their numbers "
+               "separated by commas, for example: 1,3\n"
+               "If there are no answer options, reply with a complete answer as plain text without markdown. " +
+               language_rule(cfg) + " " + style_rule(cfg) + "\n"
+               "If there is no question or task in the image, reply 0." + user_rules(cfg);
+    }
+    return {};
+}
+
+constexpr const char* kNumberUserPrompt = "Which option is correct?";
+constexpr const char* kFullUserPrompt = "Answer the question in the image.";
 
 std::string format_number(double d) {
     char buf[32];
@@ -46,8 +111,15 @@ std::string extra_members(const std::string& extra) {
 
 }  // namespace
 
-Request build_request(const Config& cfg, const std::string& image_base64, const std::string& media_type) {
-    const std::string& system = cfg.prompt.empty() ? std::string(kSystemPrompt) : cfg.prompt;
+Request build_request(const Config& cfg, const std::string& image_base64, const std::string& media_type, Kind kind,
+                      bool region) {
+    const std::string system = system_prompt(cfg, kind, region);
+    const std::string user = kind == Kind::Number ? kNumberUserPrompt : kFullUserPrompt;
+    // Для номера хватает пары токенов; текстовому ответу нужно место.
+    std::optional<int> max_tokens = cfg.max_tokens;
+    if (kind != Kind::Number && max_tokens) max_tokens = std::max(*max_tokens, 512);
+    const int full_tokens = cfg.full_length == "long" ? 1000 : cfg.full_length == "medium" ? 700 : 400;
+    const int anthropic_max = kind == Kind::Number ? cfg.max_tokens.value_or(16) : std::max(cfg.max_tokens.value_or(0), full_tokens);
     Request r;
     std::string& b = r.body;
     b.reserve(image_base64.size() + 4096);
@@ -56,14 +128,14 @@ Request build_request(const Config& cfg, const std::string& image_base64, const 
         r.url = cfg.base_url + "/v1/messages";
         r.headers = {"x-api-key: " + cfg.api_key, "anthropic-version: 2023-06-01", "content-type: application/json"};
         b += "{\"model\":" + json::quote(cfg.model);
-        b += ",\"max_tokens\":" + std::to_string(cfg.max_tokens.value_or(16));
+        b += ",\"max_tokens\":" + std::to_string(anthropic_max);
         if (cfg.temperature) b += ",\"temperature\":" + format_number(*cfg.temperature);
         b += ",\"system\":" + json::quote(system);
         b += ",\"messages\":[{\"role\":\"user\",\"content\":[";
         b += "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":" + json::quote(media_type);
         b += ",\"data\":\"";
         b += image_base64;
-        b += "\"}},{\"type\":\"text\",\"text\":" + json::quote(kUserPrompt) + "}]}]";
+        b += "\"}},{\"type\":\"text\",\"text\":" + json::quote(user) + "}]}]";
     } else if (cfg.provider == "gemini") {
         // Родной API Gemini (generateContent): модель в адресе, ключ в заголовке.
         std::string model = cfg.model;
@@ -74,11 +146,11 @@ Request build_request(const Config& cfg, const std::string& image_base64, const 
         b += ",\"contents\":[{\"role\":\"user\",\"parts\":[";
         b += "{\"inlineData\":{\"mimeType\":" + json::quote(media_type) + ",\"data\":\"";
         b += image_base64;
-        b += "\"}},{\"text\":" + json::quote(kUserPrompt) + "}]}]";
+        b += "\"}},{\"text\":" + json::quote(user) + "}]}]";
         // Рассуждения тоже расходуют maxOutputTokens, поэтому лимит — только если задан явно.
         std::string gen;
         auto add = [&gen](const std::string& field) { gen += (gen.empty() ? "" : ",") + field; };
-        if (cfg.max_tokens) add("\"maxOutputTokens\":" + std::to_string(*cfg.max_tokens));
+        if (max_tokens) add("\"maxOutputTokens\":" + std::to_string(*max_tokens));
         if (cfg.temperature) add("\"temperature\":" + format_number(*cfg.temperature));
         if (!cfg.thinking.empty()) add("\"thinkingConfig\":{\"thinkingLevel\":" + json::quote(cfg.thinking) + "}");
         if (!gen.empty()) b += ",\"generationConfig\":{" + gen + "}";
@@ -88,14 +160,14 @@ Request build_request(const Config& cfg, const std::string& image_base64, const 
         r.headers.push_back("Content-Type: application/json");
         b += "{\"model\":" + json::quote(cfg.model);
         // У reasoning-моделей лимит съедают рассуждения, поэтому без явной настройки его не шлём.
-        if (cfg.max_tokens) b += ",\"max_tokens\":" + std::to_string(*cfg.max_tokens);
+        if (max_tokens) b += ",\"max_tokens\":" + std::to_string(*max_tokens);
         if (cfg.temperature) b += ",\"temperature\":" + format_number(*cfg.temperature);
         if (!cfg.thinking.empty()) b += ",\"reasoning_effort\":" + json::quote(cfg.thinking);
         b += ",\"messages\":[{\"role\":\"system\",\"content\":" + json::quote(system) + "},";
         b += "{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:";
         b += media_type + ";base64,";
         b += image_base64;
-        b += "\"}},{\"type\":\"text\",\"text\":" + json::quote(kUserPrompt) + "}]}]";
+        b += "\"}},{\"type\":\"text\",\"text\":" + json::quote(user) + "}]}]";
     }
 
     if (const std::string members = extra_members(cfg.extra); !members.empty()) b += "," + members;
@@ -250,6 +322,82 @@ std::string snippet(std::string_view text, size_t limit) {
     }
     if (cut) out += "…";
     return out;
+}
+
+namespace {
+
+// Ответ из одного номера (или списка номеров): «2», «1, 3», «Ответ: Б».
+bool is_number_reply(std::string_view text) {
+    if (text.find('\n') != std::string_view::npos) return false;
+    std::string_view t = trim_view(text, " \t.*)(");
+    if (const size_t colon = t.find(':'); colon != std::string_view::npos && colon <= 14) t = trim_view(t.substr(colon + 1), " \t.*)(");
+    if (t.empty()) return false;
+    if (t.find_first_not_of("0123456789, ") == std::string_view::npos) {
+        // Номер варианта — небольшое число: «1945» или «120» — это уже ответ, а не вариант.
+        bool any = false;
+        for (size_t i = 0; i < t.size();) {
+            if (!std::isdigit(static_cast<unsigned char>(t[i]))) {
+                ++i;
+                continue;
+            }
+            int value = 0;
+            for (; i < t.size() && std::isdigit(static_cast<unsigned char>(t[i])); ++i) value = std::min(value * 10 + (t[i] - '0'), 1000);
+            if (value < 1 || value > 20) return false;
+            any = true;
+        }
+        return any;
+    }
+    if (t.size() == 1) return std::isalpha(static_cast<unsigned char>(t[0]));
+    if (t.size() == 2 && static_cast<unsigned char>(t[0]) == 0xD0) return true;  // одна кириллическая буква А…Е
+    return false;
+}
+
+}  // namespace
+
+std::string clean_text(std::string_view text, size_t limit) {
+    std::string out;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        const size_t nl = text.find('\n', pos);
+        std::string_view line = text.substr(pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos);
+        pos = nl == std::string_view::npos ? text.size() + 1 : nl + 1;
+
+        std::string clean;
+        for (size_t i = 0; i < line.size(); ++i) {
+            const char c = line[i];
+            if (c == '*' || c == '`' || c == '\r') continue;
+            if (c == '_' && i + 1 < line.size() && line[i + 1] == '_') { ++i; continue; }
+            if (c == '\t') { clean += ' '; continue; }
+            if (c == ' ' && !clean.empty() && clean.back() == ' ') continue;
+            clean += c;
+        }
+        std::string_view t = trim_view(clean, " ");
+        while (!t.empty() && t.front() == '#') t = trim_view(t.substr(1), " ");  // заголовки markdown
+        if (t.empty()) continue;  // пустые строки только занимают место
+        if (!out.empty()) out += '\n';
+        out += t;
+    }
+    if (out.size() > limit) {
+        size_t n = limit;
+        while (n > 0 && (static_cast<unsigned char>(out[n]) & 0xC0) == 0x80) --n;
+        out.resize(n);
+        out += "…";
+    }
+    return out;
+}
+
+Answer make_answer(std::string_view reply, Kind kind, size_t limit) {
+    if (kind == Kind::Number) return {extract_answer(reply), false};
+    std::string text = clean_text(reply, limit);
+    const std::string_view t = trim_view(text, " .");
+    if (t.empty() || t == "0") return {"?", false};  // вопроса на картинке нет
+    if (kind == Kind::Auto && is_number_reply(text)) return {extract_answer(text), false};
+    return {std::move(text), true};
+}
+
+size_t answer_limit(const Config& cfg) {
+    // Кириллица — два байта на букву, плюс запас: модель не всегда укладывается в лимит.
+    return length_limit(cfg) * 3 + 100;
 }
 
 }  // namespace llm

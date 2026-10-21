@@ -141,6 +141,10 @@ bool apply(Config& c, const std::string& key, const std::string& value, std::str
     }
     else if (key == "extra") c.extra = value;
     else if (key == "prompt") c.prompt = value;
+    else if (key == "answer_mode") {
+        if (value != "number" && value != "full") return bad();
+        c.answer_mode = value;
+    }
     else if (key == "capture") c.capture = value;
     else if (key == "capture_protocol") c.capture_protocol = value;
     else if (key == "font") c.font = value;
@@ -163,10 +167,24 @@ bool apply(Config& c, const std::string& key, const std::string& value, std::str
         if (!parse_color(value, c.color)) return bad();
     } else if (key == "background") {
         if (!parse_color(value, c.background)) return bad();
-    } else if (key == "margin_top") {
-        if (!parse_number(value, c.margin_top)) return bad();
-    } else if (key == "margin_left") {
-        if (!parse_number(value, c.margin_left)) return bad();
+    } else if (key == "margin_y" || key == "margin_top") {  // margin_top/left — старые имена
+        if (!parse_number(value, c.margin_y)) return bad();
+    } else if (key == "margin_x" || key == "margin_left") {
+        if (!parse_number(value, c.margin_x)) return bad();
+    } else if (key == "position") {
+        if (value != "top-left" && value != "top-right" && value != "bottom-left" && value != "bottom-right") return bad();
+        c.position = value;
+    } else if (key == "full_length") {
+        if (value != "short" && value != "medium" && value != "long") return bad();
+        c.full_length = value;
+    } else if (key == "full_explain") {
+        if (!parse_bool(value, b)) return bad();
+        c.full_explain = b;
+    } else if (key == "answer_language") {
+        if (value != "auto" && value != "ru" && value != "en") return bad();
+        c.answer_language = value;
+    } else if (key == "instructions") {
+        c.instructions = value;
     } else if (key == "over_panels") {
         if (!parse_bool(value, b)) return bad();
         c.over_panels = b;
@@ -175,6 +193,17 @@ bool apply(Config& c, const std::string& key, const std::string& value, std::str
     } else if (key == "busy_indicator") {
         if (!parse_bool(value, b)) return bad();
         c.busy_indicator = b;
+    } else if (key == "full_font_size") {
+        if (!parse_number(value, c.full_font_size)) return bad();
+    } else if (key == "full_width") {
+        if (!parse_number(value, c.full_width)) return bad();
+    } else if (key == "full_max_lines") {
+        if (!parse_number(value, c.full_max_lines)) return bad();
+    } else if (key == "hide_after_full") {
+        if (!parse_number(value, c.hide_after_full)) return bad();
+    } else if (key == "region_hotkey") {
+        if (!valid_hotkey(value)) return bad();
+        c.region_hotkey = value;
     } else if (key == "hotkey") {
         if (!valid_hotkey(value)) return bad();
         c.hotkey = value;
@@ -322,7 +351,11 @@ bool finalize_config(Config& c, bool need_api, std::string& error) {
     if (c.max_size != 0 && c.max_size < 64) return fail("max_size: 0 или не меньше 64");
     if (c.font_size < 4 || c.font_size > 200) return fail("font_size: от 4 до 200");
     if (c.timeout < 1 || c.timeout > 600) return fail("timeout: от 1 до 600 секунд");
-    if (c.hide_after < 0) return fail("hide_after не может быть отрицательным");
+    if (c.hide_after < 0 || c.hide_after_full < 0) return fail("hide_after не может быть отрицательным");
+    if (c.full_font_size < 6 || c.full_font_size > 72) return fail("full_font_size: от 6 до 72");
+    if (c.full_width < 120 || c.full_width > 4000) return fail("full_width: от 120 до 4000");
+    if (c.full_max_lines < 1 || c.full_max_lines > 60) return fail("full_max_lines: от 1 до 60");
+    if (c.margin_x < 0 || c.margin_x > 2000 || c.margin_y < 0 || c.margin_y > 2000) return fail("margin: от 0 до 2000");
     if (!c.extra.empty()) {
         const auto v = json::parse(c.extra);
         if (!v || !v->is_object()) return fail("extra должен быть JSON-объектом, например {\"top_p\": 1}");
@@ -391,10 +424,13 @@ bool update_config_file(const std::string& path, const ConfigValues& values, std
     for (const auto& [key, value] : values) {
         // Действует последнее присваивание, поэтому меняем именно его. Если ключ
         // задан только закомментированным примером, раскомментируем пример.
+        // У отступов есть старые имена: правим ту строку, что уже есть в файле.
+        const std::string alias = key == "margin_x" ? "margin_left" : key == "margin_y" ? "margin_top" : "";
+        auto matches = [&](const std::string& k) { return k == key || (!alias.empty() && k == alias); };
         int active = -1, commented = -1;
         for (size_t i = 0; i < lines.size(); ++i) {
-            if (line_key(lines[i], false) == key) active = static_cast<int>(i);
-            else if (commented < 0 && line_key(lines[i], true) == key) commented = static_cast<int>(i);
+            if (matches(line_key(lines[i], false))) active = static_cast<int>(i);
+            else if (commented < 0 && matches(line_key(lines[i], true))) commented = static_cast<int>(i);
         }
         const std::string line = key + " = " + format_value(value);
         if (active >= 0) lines[static_cast<size_t>(active)] = line;
@@ -436,6 +472,11 @@ std::string config_json(const Config& c, const std::string& path, bool exists, c
     if (c.temperature) num("temperature", *c.temperature);
     str("thinking", c.thinking);
     flag("custom_prompt", !c.prompt.empty());
+    str("answer_mode", c.answer_mode);
+    str("full_length", c.full_length);
+    flag("full_explain", c.full_explain);
+    str("answer_language", c.answer_language);
+    str("instructions", c.instructions);
     flag("extra_set", !c.extra.empty());
     num("timeout", c.timeout);
     str("capture", c.capture);
@@ -446,12 +487,18 @@ std::string config_json(const Config& c, const std::string& path, bool exists, c
     num("font_size", c.font_size);
     str("color", format_color(c.color));
     str("background", format_color(c.background));
-    num("margin_top", c.margin_top);
-    num("margin_left", c.margin_left);
+    str("position", c.position);
+    num("margin_x", c.margin_x);
+    num("margin_y", c.margin_y);
     flag("over_panels", c.over_panels);
     num("hide_after", c.hide_after);
     flag("busy_indicator", c.busy_indicator);
+    num("full_font_size", c.full_font_size);
+    num("full_width", c.full_width);
+    num("full_max_lines", c.full_max_lines);
+    num("hide_after_full", c.hide_after_full);
     str("hotkey", c.hotkey);
+    str("region_hotkey", c.region_hotkey);
     flag("autostart", c.autostart);
     return j + "}";
 }

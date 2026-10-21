@@ -45,13 +45,13 @@ std::optional<std::string> request(const std::string& command) {
 
 }  // namespace
 
-std::optional<Monitor> focused_monitor() {
+std::vector<Monitor> monitors() {
+    std::vector<Monitor> out;
     const auto reply = request("j/monitors");
-    if (!reply) return std::nullopt;
-    const auto monitors = json::parse(*reply);
-    if (!monitors) return std::nullopt;
-    for (const auto& m : monitors->items()) {
-        if (!m["focused"].boolean()) continue;
+    if (!reply) return out;
+    const auto list = json::parse(*reply);
+    if (!list) return out;
+    for (const auto& m : list->items()) {
         Monitor mon;
         mon.name = m["name"].str();
         mon.x = static_cast<int>(m["x"].num());
@@ -60,7 +60,15 @@ std::optional<Monitor> focused_monitor() {
         mon.height = static_cast<int>(m["height"].num());
         mon.scale = m["scale"].num(1);
         mon.transform = static_cast<int>(m["transform"].num());
-        return mon;
+        mon.focused = m["focused"].boolean();
+        out.push_back(std::move(mon));
+    }
+    return out;
+}
+
+std::optional<Monitor> focused_monitor() {
+    for (auto& m : monitors()) {
+        if (m.focused) return m;
     }
     return std::nullopt;
 }

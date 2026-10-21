@@ -26,9 +26,11 @@
 #include <iostream>
 #include <iterator>
 #include <optional>
+#include <spawn.h>
 #include <sys/file.h>
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 namespace {
@@ -39,7 +41,10 @@ double ms_since(Clock::time_point t) {
     return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
 }
 
-constexpr const char* kVersion = "1.2.1";
+constexpr const char* kVersion = "1.4.0";
+
+// Сигнал «выделить область и ответить» (pkill -RTMIN+1 -x quizhint).
+int region_signal() { return SIGRTMIN + 1; }
 
 struct Options {
     std::string config_path;
@@ -53,6 +58,8 @@ struct Options {
     bool print_config = false;
     bool set_stdin = false;
     ConfigValues set_values;
+    std::string mode;     // number | full — вместо answer_mode из конфига
+    bool region = false;  // --once: выделить область вместо снимка экрана
 };
 
 void usage(FILE* out) {
@@ -61,14 +68,17 @@ void usage(FILE* out) {
         "\n"
         "Без параметров работает в фоне: по SIGUSR1 снимает активный монитор, спрашивает\n"
         "модель и показывает номер правильного ответа в левом верхнем углу.\n"
-        "  pkill -USR1 -x quizhint   спросить (повесьте на горячую клавишу)\n"
-        "  pkill -USR2 -x quizhint   спрятать цифру / отменить запрос\n"
+        "  pkill -USR1 -x quizhint     спросить про весь экран (повесьте на горячую клавишу)\n"
+        "  pkill -RTMIN+1 -x quizhint  выделить область мышью и спросить про неё\n"
+        "  pkill -USR2 -x quizhint     спрятать ответ / отменить запрос\n"
         "\n"
         "  -c, --config ФАЙЛ    конфиг (по умолчанию ~/.config/quizhint/config)\n"
         "      --once           один раз: снимок → ответ (печатается в stdout) → выход\n"
         "      --image ФАЙЛ     отправить готовую картинку вместо снимка (подразумевает --once)\n"
         "      --save ФАЙЛ      сохранить JPEG, который уходит модели\n"
         "      --show ТЕКСТ     только показать ТЕКСТ в углу — проверка внешнего вида\n"
+        "      --mode РЕЖИМ     number — номер варианта, full — короткий полный ответ\n"
+        "      --region         с --once: выделить область мышью (нужен slurp)\n"
         "  -v, --verbose        подробный лог с замерами времени\n"
         "\n"
         "Для плагина Omarchy и скриптов:\n"
@@ -157,6 +167,7 @@ public:
           capturer_(display_, cfg_.capture_protocol) {}
 
     ~App() {
+        stop_select();
         if (hide_fd_ >= 0) close(hide_fd_);
         if (delay_fd_ >= 0) close(delay_fd_);
     }
@@ -167,18 +178,24 @@ private:
     enum class Phase {
         Idle,
         Hiding,     // ждём, пока композитор уберёт старую цифру с экрана
+        Selecting,  // пользователь выделяет область (slurp)
+        Settling,   // рамка выделения закрылась — ждём кадр без неё
         Capturing,  // снимаем экран
         Asking,     // ждём ответ модели
     };
 
     Output* pick_output();
-    void trigger();
+    void trigger(bool region);
     void begin_capture();
+    void start_select();
+    void on_select_readable();
+    void finish_select(int status);
+    void stop_select();
     void on_frame(const RawFrame* frame, const std::string& error);
-    std::optional<PixelRect> window_crop(const RawFrame& frame) const;
+    std::optional<PixelRect> crop_rect(const RawFrame& frame) const;
     void send(const std::vector<uint8_t>& image, const std::string& media_type);
     void on_response(const HttpResult& result);
-    void show(const std::string& text);
+    void show(const std::string& text, bool full = false);
     void fail(const std::string& message);
     void cancel();
     void handle_signals();
@@ -198,7 +215,12 @@ private:
     Phase phase_ = Phase::Idle;
     Output* target_ = nullptr;
     std::optional<hypr::Monitor> monitor_;
-    std::optional<hypr::Rect> window_;
+    std::optional<hypr::Rect> window_;  // capture = window: активное окно
+    std::optional<hypr::Rect> region_;  // выделенная область
+    llm::Kind kind_ = llm::Kind::Number;
+    pid_t select_pid_ = -1;
+    int select_fd_ = -1;
+    std::string select_out_;
     Clock::time_point t_trigger_{}, t_request_{};
     bool quit_ = false;
     int exit_code_ = 0;
@@ -234,12 +256,17 @@ int App::run() {
     overlay_.move_to(output);
 
     if (opt_.show) {
-        overlay_.set(opt_.show_text);
-        arm_timer(hide_fd_, (cfg_.hide_after > 0 ? cfg_.hide_after : 3) * 1000);
+        // --mode full: показать текст так, как выглядит полный ответ.
+        const bool full = cfg_.answer_mode == "full";
+        overlay_.set(opt_.show_text, full ? Overlay::Kind::Text : Overlay::Kind::Badge);
+        // Это проверка внешнего вида — дольше нескольких секунд держать незачем.
+        const double seconds = full ? cfg_.hide_after_full : cfg_.hide_after;
+        arm_timer(hide_fd_, std::clamp(seconds > 0 ? seconds : 4.0, 2.0, 6.0) * 1000);
     } else if (opt_.once) {
-        trigger();
+        trigger(opt_.region && opt_.image_path.empty());
     } else {
-        log_info("работаю: модель %s, сигнал для ответа — pkill -USR1 -x quizhint", cfg_.model.c_str());
+        log_info("работаю: модель %s, режим %s; весь экран — pkill -USR1 -x quizhint, область — pkill -RTMIN+1 -x quizhint",
+                 cfg_.model.c_str(), cfg_.answer_mode == "full" ? "полный ответ" : "цифра");
         emit_event(opt_.events, "ready",
                    json_field("provider", cfg_.provider) + "," + json_field("model", cfg_.model) + "," +
                        json_field("capture", cfg_.capture) + "," + json_field("version", kVersion));
@@ -256,9 +283,11 @@ int App::run() {
             {sig_fd_, CURL_WAIT_POLLIN, 0},
             {hide_fd_, CURL_WAIT_POLLIN, 0},
             {delay_fd_, CURL_WAIT_POLLIN, 0},
+            {select_fd_, CURL_WAIT_POLLIN, 0},
         };
+        const unsigned nfds = select_fd_ >= 0 ? 5 : 4;
         // curl ждёт и свои сокеты, и наши дескрипторы — один цикл без потоков.
-        const CURLMcode mc = curl_multi_poll(http_.multi(), fds, 4, 60000, nullptr);
+        const CURLMcode mc = curl_multi_poll(http_.multi(), fds, nfds, 60000, nullptr);
         if (mc != CURLM_OK) {
             display_.cancel_poll();
             log_info("curl_multi_poll: %s", curl_multi_strerror(mc));
@@ -277,8 +306,9 @@ int App::run() {
         }
         if (fds[3].revents) {
             drain(delay_fd_);
-            if (phase_ == Phase::Hiding) begin_capture();
+            if (phase_ == Phase::Hiding || phase_ == Phase::Settling) begin_capture();
         }
+        if (nfds > 4 && fds[4].revents && select_fd_ >= 0) on_select_readable();
         HttpResult result;
         if (http_.active() && http_.perform(result)) on_response(result);
     }
@@ -295,17 +325,30 @@ Output* App::pick_output() {
     return display_.first_output();
 }
 
-void App::trigger() {
+void App::trigger(bool region) {
+    // Повторное нажатие клавиши выделения, пока рамка на экране, — отмена.
+    if (region && phase_ == Phase::Selecting) {
+        cancel();
+        emit_event(opt_.events, "idle");
+        return;
+    }
     cancel();
     disarm_timer(hide_fd_);
     t_trigger_ = Clock::now();
+    region_.reset();
+    window_.reset();
+    // В режиме «цифра» выделенная область без вариантов ответа получает короткий ответ.
+    kind_ = cfg_.answer_mode == "full" ? llm::Kind::Full : (region ? llm::Kind::Auto : llm::Kind::Number);
+    if (region) {
+        start_select();
+        return;
+    }
     emit_event(opt_.events, "busy");
     target_ = pick_output();
     if (!target_) {
         fail("не найден монитор");
         return;
     }
-    window_.reset();
     if (cfg_.capture == "window" && monitor_) window_ = hypr::active_window();
     overlay_.move_to(target_);
 
@@ -343,6 +386,124 @@ void App::begin_capture() {
     capturer_.start(target_, [this](const RawFrame* frame, const std::string& error) { on_frame(frame, error); });
 }
 
+// Рамку выделения рисует slurp: он печатает «x y w h монитор» в логических
+// координатах и выходит (код 1, если выделение отменили клавишей Esc).
+void App::start_select() {
+    if (overlay_.shown()) overlay_.set("");  // старый ответ не должен мешать выделять
+    int pipefd[2];
+    if (pipe2(pipefd, O_CLOEXEC) != 0) {
+        fail(std::string("pipe: ") + std::strerror(errno));
+        return;
+    }
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    // slurp читает варианты рамок из stdin, если это не терминал, — даём пустой.
+    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+
+    // Наши заблокированные сигналы наследуются — дочернему процессу их надо вернуть.
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    sigset_t none, defaults;
+    sigemptyset(&none);
+    sigemptyset(&defaults);
+    for (const int sig : {SIGUSR1, SIGUSR2, SIGINT, SIGTERM, SIGHUP, SIGPIPE, region_signal()}) sigaddset(&defaults, sig);
+    posix_spawnattr_setsigmask(&attr, &none);
+    posix_spawnattr_setsigdefault(&attr, &defaults);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+
+    const char* argv[] = {"slurp", "-b", "00000055", "-c", "ffffffdd", "-s", "ffffff12", "-w", "2",
+                          "-f", "%x %y %w %h %o", nullptr};
+    pid_t pid = -1;
+    const int rc = posix_spawnp(&pid, "slurp", &actions, &attr, const_cast<char* const*>(argv), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    posix_spawnattr_destroy(&attr);
+    close(pipefd[1]);
+    if (rc != 0) {
+        close(pipefd[0]);
+        fail(rc == ENOENT ? "для выделения области нужна программа slurp (sudo pacman -S slurp)"
+                          : std::string("не удалось запустить slurp: ") + std::strerror(rc));
+        return;
+    }
+    fcntl(pipefd[0], F_SETFL, fcntl(pipefd[0], F_GETFL) | O_NONBLOCK);
+    select_pid_ = pid;
+    select_fd_ = pipefd[0];
+    select_out_.clear();
+    phase_ = Phase::Selecting;
+    emit_event(opt_.events, "selecting");
+}
+
+void App::on_select_readable() {
+    char buf[256];
+    ssize_t n;
+    while ((n = read(select_fd_, buf, sizeof buf)) > 0) select_out_.append(buf, static_cast<size_t>(n));
+    if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;
+    // Конец вывода: slurp завершился.
+    close(select_fd_);
+    select_fd_ = -1;
+    int status = 0;
+    while (waitpid(select_pid_, &status, 0) < 0 && errno == EINTR) {
+    }
+    select_pid_ = -1;
+    finish_select(status);
+}
+
+void App::finish_select(int status) {
+    phase_ = Phase::Idle;
+    int x = 0, y = 0, w = 0, h = 0;
+    char name[128] = {};
+    const bool ok = WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+                    std::sscanf(select_out_.c_str(), "%d %d %d %d %127s", &x, &y, &w, &h, name) >= 4;
+    select_out_.clear();
+    if (!ok || w < 8 || h < 8) {
+        log_debug("выделение отменено");
+        emit_event(opt_.events, "idle");
+        if (opt_.once) {
+            exit_code_ = 1;
+            quit_ = true;
+        }
+        return;
+    }
+    // Монитор: по имени от slurp, иначе тот, где центр области.
+    std::optional<hypr::Monitor> mon;
+    for (auto& m : hypr::monitors()) {
+        const bool by_name = name[0] && m.name == name;
+        const double lw = m.scale > 0 ? m.width / m.scale : m.width, lh = m.scale > 0 ? m.height / m.scale : m.height;
+        const bool by_center = x + w / 2 >= m.x && x + w / 2 < m.x + (m.transform % 2 ? lh : lw) &&
+                               y + h / 2 >= m.y && y + h / 2 < m.y + (m.transform % 2 ? lw : lh);
+        if (by_name || (!mon && by_center)) mon = m;
+        if (by_name) break;
+    }
+    target_ = mon ? display_.output_by_name(mon->name) : nullptr;
+    if (!target_) {
+        fail("не удалось определить монитор выделенной области (нужен Hyprland)");
+        return;
+    }
+    monitor_ = mon;
+    region_ = hypr::Rect{x, y, w, h};
+    log_debug("область %dx%d+%d+%d на %s", w, h, x, y, mon->name.c_str());
+    overlay_.move_to(target_);
+    t_trigger_ = Clock::now();
+    emit_event(opt_.events, "busy");
+    // Снимаем чуть позже: рамка slurp должна успеть исчезнуть с экрана.
+    phase_ = Phase::Settling;
+    arm_timer(delay_fd_, 150);
+}
+
+void App::stop_select() {
+    if (select_pid_ > 0) {
+        kill(select_pid_, SIGTERM);
+        while (waitpid(select_pid_, nullptr, 0) < 0 && errno == EINTR) {
+        }
+        select_pid_ = -1;
+    }
+    if (select_fd_ >= 0) {
+        close(select_fd_);
+        select_fd_ = -1;
+    }
+    select_out_.clear();
+}
+
 void App::on_frame(const RawFrame* frame, const std::string& error) {
     if (phase_ != Phase::Capturing) return;
     if (!frame) {
@@ -353,7 +514,7 @@ void App::on_frame(const RawFrame* frame, const std::string& error) {
     const auto t0 = Clock::now();
     RgbImage image;
     std::string err;
-    if (!frame_to_rgb(*frame, window_crop(*frame), image, err)) {
+    if (!frame_to_rgb(*frame, crop_rect(*frame), image, err)) {
         fail(err);
         return;
     }
@@ -374,24 +535,25 @@ void App::on_frame(const RawFrame* frame, const std::string& error) {
     send(jpeg, "image/jpeg");
 }
 
-// Прямоугольник активного окна в пикселях кадра (режим capture = window).
-std::optional<PixelRect> App::window_crop(const RawFrame& frame) const {
-    if (!window_ || !monitor_ || monitor_->scale <= 0 || monitor_->width <= 0 || monitor_->height <= 0)
+// Выделенная область или активное окно (capture = window) в пикселях кадра.
+std::optional<PixelRect> App::crop_rect(const RawFrame& frame) const {
+    const auto& rect = region_ ? region_ : window_;
+    if (!rect || !monitor_ || monitor_->scale <= 0 || monitor_->width <= 0 || monitor_->height <= 0)
         return std::nullopt;
     double lw = monitor_->width / monitor_->scale;
     double lh = monitor_->height / monitor_->scale;
     if (monitor_->transform % 2 == 1) std::swap(lw, lh);  // поворот на 90/270
     const double kx = frame.width / lw, ky = frame.height / lh;
-    const int x0 = std::clamp(static_cast<int>(std::floor((window_->x - monitor_->x) * kx)), 0, frame.width);
-    const int y0 = std::clamp(static_cast<int>(std::floor((window_->y - monitor_->y) * ky)), 0, frame.height);
-    const int x1 = std::clamp(static_cast<int>(std::ceil((window_->x + window_->w - monitor_->x) * kx)), 0, frame.width);
-    const int y1 = std::clamp(static_cast<int>(std::ceil((window_->y + window_->h - monitor_->y) * ky)), 0, frame.height);
-    if (x1 - x0 < 16 || y1 - y0 < 16) return std::nullopt;
+    const int x0 = std::clamp(static_cast<int>(std::floor((rect->x - monitor_->x) * kx)), 0, frame.width);
+    const int y0 = std::clamp(static_cast<int>(std::floor((rect->y - monitor_->y) * ky)), 0, frame.height);
+    const int x1 = std::clamp(static_cast<int>(std::ceil((rect->x + rect->w - monitor_->x) * kx)), 0, frame.width);
+    const int y1 = std::clamp(static_cast<int>(std::ceil((rect->y + rect->h - monitor_->y) * ky)), 0, frame.height);
+    if (x1 - x0 < 8 || y1 - y0 < 8) return std::nullopt;
     return PixelRect{x0, y0, x1 - x0, y1 - y0};
 }
 
 void App::send(const std::vector<uint8_t>& image, const std::string& media_type) {
-    auto request = llm::build_request(cfg_, base64(image.data(), image.size()), media_type);
+    auto request = llm::build_request(cfg_, base64(image.data(), image.size()), media_type, kind_, region_.has_value());
     std::string error;
     if (!http_.start(request.url, request.headers, std::move(request.body), cfg_.timeout * 1000L, error)) {
         fail("запрос: " + error);
@@ -418,25 +580,27 @@ void App::on_response(const HttpResult& result) {
         fail(error);
         return;
     }
-    const std::string answer = llm::extract_answer(text);
+    const llm::Answer answer = llm::make_answer(text, kind_, llm::answer_limit(cfg_));
     const double seconds = ms_since(t_trigger_) / 1000;
-    log_info("ответ %s за %.2f с (запрос %.2f с), модель: «%s»", answer.c_str(), seconds,
-             ms_since(t_request_) / 1000, llm::snippet(text, 60).c_str());
+    log_info("ответ за %.2f с (запрос %.2f с): «%s»", seconds, ms_since(t_request_) / 1000,
+             llm::snippet(answer.text, 80).c_str());
+    log_debug("модель: «%s»", llm::snippet(text, 300).c_str());
     char secs[32];
     std::snprintf(secs, sizeof secs, "%.2f", seconds);
     emit_event(opt_.events, "answer",
-               json_field("answer", answer) + "," + json_field("text", llm::snippet(text, 200)) +
+               json_field("answer", answer.text) + "," + json_field("mode", answer.full ? "full" : "number") + "," +
+                   json_field("region", region_ ? "1" : "") + "," + json_field("text", llm::snippet(text, 600)) +
                    ",\"seconds\":" + secs);
     if (opt_.once) {
-        std::printf("%s\n", answer.c_str());
+        std::printf("%s\n", answer.text.c_str());
         std::fflush(stdout);
     }
-    show(answer);
+    show(answer.text, answer.full);
 }
 
-void App::show(const std::string& text) {
-    overlay_.set(text);
-    double seconds = cfg_.hide_after;
+void App::show(const std::string& text, bool full) {
+    overlay_.set(text, full ? Overlay::Kind::Text : Overlay::Kind::Badge);
+    double seconds = full ? cfg_.hide_after_full : cfg_.hide_after;
     if (opt_.once && seconds <= 0) seconds = 5;
     if (seconds > 0) arm_timer(hide_fd_, seconds * 1000);
 }
@@ -450,6 +614,7 @@ void App::fail(const std::string& message) {
 }
 
 void App::cancel() {
+    stop_select();
     capturer_.cancel();
     http_.cancel();
     disarm_timer(delay_fd_);
@@ -459,9 +624,13 @@ void App::cancel() {
 void App::handle_signals() {
     signalfd_siginfo si;
     while (read(sig_fd_, &si, sizeof si) == static_cast<ssize_t>(sizeof si)) {
+        if (static_cast<int>(si.ssi_signo) == region_signal()) {
+            trigger(true);
+            continue;
+        }
         switch (si.ssi_signo) {
         case SIGUSR1:
-            trigger();
+            trigger(false);
             break;
         case SIGUSR2:
             cancel();
@@ -492,10 +661,11 @@ int main(int argc, char** argv) {
     sigemptyset(&early);
     sigaddset(&early, SIGUSR1);
     sigaddset(&early, SIGUSR2);
+    sigaddset(&early, region_signal());
     sigprocmask(SIG_BLOCK, &early, nullptr);
 
     Options opt;
-    enum { kOnce = 1000, kImage, kSave, kShow, kEvents, kPrintConfig, kSet, kSetStdin, kPrintVersion };
+    enum { kOnce = 1000, kImage, kSave, kShow, kEvents, kPrintConfig, kSet, kSetStdin, kPrintVersion, kMode, kRegion };
     static const option long_options[] = {
         {"config", required_argument, nullptr, 'c'},
         {"once", no_argument, nullptr, kOnce},
@@ -508,6 +678,8 @@ int main(int argc, char** argv) {
         {"set", required_argument, nullptr, kSet},
         {"set-stdin", no_argument, nullptr, kSetStdin},
         {"version", no_argument, nullptr, kPrintVersion},
+        {"mode", required_argument, nullptr, kMode},
+        {"region", no_argument, nullptr, kRegion},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0},
     };
@@ -534,6 +706,14 @@ int main(int argc, char** argv) {
             }
             break;
         case kSetStdin: opt.set_stdin = true; break;
+        case kMode:
+            opt.mode = optarg;
+            if (opt.mode != "number" && opt.mode != "full") {
+                log_info("--mode: number или full");
+                return 2;
+            }
+            break;
+        case kRegion: opt.region = true; break;
         case kPrintVersion: std::printf("quizhint %s\n", kVersion); return 0;
         case 'h': usage(stdout); return 0;
         default: usage(stderr); return 2;
@@ -580,7 +760,7 @@ int main(int argc, char** argv) {
     // (резолвер curl), чтобы маска унаследовалась.
     sigset_t mask;
     sigemptyset(&mask);
-    for (const int s : {SIGUSR1, SIGUSR2, SIGINT, SIGTERM, SIGHUP}) sigaddset(&mask, s);
+    for (const int s : {SIGUSR1, SIGUSR2, SIGINT, SIGTERM, SIGHUP, region_signal()}) sigaddset(&mask, s);
     sigprocmask(SIG_BLOCK, &mask, nullptr);
     std::signal(SIGPIPE, SIG_IGN);
     const int sig_fd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
@@ -599,6 +779,7 @@ int main(int argc, char** argv) {
     std::string error;
     if (!load_config(path, explicit_path, cfg, error) || !finalize_config(cfg, !opt.show, error))
         return startup_error(error);
+    if (!opt.mode.empty()) cfg.answer_mode = opt.mode;
 
     if (!opt.once && !opt.show && acquire_lock() == -2)
         return startup_error("уже запущен (остановить: pkill -x quizhint)");

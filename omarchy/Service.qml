@@ -18,6 +18,8 @@ Item {
   readonly property string configError: config.ok === false ? String(config.error || "") : ""
   readonly property string configPath: String(config.path || "")
   readonly property string hotkey: String(config.hotkey || "")
+  readonly property string regionHotkey: String(config.region_hotkey || "")
+  readonly property string answerMode: String(config.answer_mode || "number")
   readonly property bool autostart: config.autostart !== false
 
   // Включатель панели: сразу показывает новое положение, пока настройка сохраняется.
@@ -28,12 +30,15 @@ Item {
   readonly property bool running: daemon.running
   property bool ready: false          // демон прислал ready
   property bool busy: false           // идёт снимок или запрос к модели
+  property bool selecting: false      // на экране рамка выделения области
   property bool showingAnswer: false  // цифра (или «!») сейчас на экране
   property bool missingBinary: false
   property string fatalError: ""      // почему демон не запустился или упал
   property string lastError: ""       // ошибка последнего запроса
   property string lastAnswer: ""
   property string lastText: ""
+  property string lastMode: "number"  // number — цифра, full — текст полного ответа
+  property bool lastRegion: false     // ответ по выделенной области
   property real lastSeconds: 0
   property double lastAnswerAt: 0
 
@@ -55,7 +60,6 @@ Item {
   property bool _refreshAgain: false
   property var _pendingSave: null
   property var _afterSave: null
-  property string _bindQueued: ""
   property bool _bindPending: false
 
   // ------------------------------------------------------------- действия
@@ -117,6 +121,22 @@ Item {
     saveProc.running = true
   }
 
+  // Пример ответа на экране с сохранёнными настройками (quizhint --show).
+  // Если настройки ещё сохраняются — покажем, когда запись закончится.
+  property string _previewQueued: ""
+
+  function preview(kind) {
+    if (saving || _pendingSave) {
+      _previewQueued = kind
+      return
+    }
+    _previewQueued = ""
+    var args = kind === "full"
+      ? ["--show", "2 — Париж. Столица Франции и её крупнейший город, стоит на реке Сене.", "--mode", "full"]
+      : ["--show", "3", "--mode", "number"]
+    Quickshell.execDetached(launcher.concat(args))
+  }
+
   function refreshConfig() {
     if (configProc.running) {
       _refreshAgain = true
@@ -130,7 +150,8 @@ Item {
   // Всё, что влияет на работу демона (без настроек самого плагина).
   function signature(cfg) {
     var copy = {}
-    for (var k in cfg) if (k !== "hotkey" && k !== "autostart" && k !== "exists") copy[k] = cfg[k]
+    var pluginOnly = ["hotkey", "region_hotkey", "autostart", "exists"]
+    for (var k in cfg) if (pluginOnly.indexOf(k) === -1) copy[k] = cfg[k]
     return JSON.stringify(copy)
   }
 
@@ -175,7 +196,13 @@ Item {
       ready = true
       fatalError = ""
       break
+    case "selecting":
+      selecting = true
+      busy = false
+      showingAnswer = false
+      break
     case "busy":
+      selecting = false
       busy = true
       showingAnswer = false
       lastError = ""
@@ -184,16 +211,20 @@ Item {
       busy = false
       showingAnswer = true
       lastAnswer = String(ev.answer || "?")
+      lastMode = ev.mode === "full" ? "full" : "number"
+      lastRegion = !!ev.region
       lastText = String(ev.text || "")
       lastSeconds = Number(ev.seconds || 0)
       lastAnswerAt = Date.now()
       break
     case "error":
+      selecting = false
       busy = false
       showingAnswer = true
       lastError = String(ev.message || "")
       break
     case "idle":
+      selecting = false
       busy = false
       showingAnswer = false
       break
@@ -205,6 +236,7 @@ Item {
 
   function daemonExited(code) {
     ready = false
+    selecting = false
     busy = false
     showingAnswer = false
     if (code === 127) {
@@ -275,7 +307,7 @@ Item {
     missingBinary = false
     _desired = -1
 
-    if (first || hotkey !== boundHotkey) bindHotkey(hotkey)
+    if (first || hotkey + "|" + regionHotkey !== boundKeys) bindHotkeys()
     if (first) startWatcher()
 
     if (!autostart) {
@@ -338,6 +370,8 @@ Item {
         var next = root._pendingSave
         root._pendingSave = null
         root.save(next)
+      } else if (root._previewQueued !== "") {
+        root.preview(root._previewQueued)
       }
     }
   }
@@ -372,54 +406,74 @@ Item {
 
   // ------------------------------------------------------------- горячая клавиша
 
-  // Бинд создаётся через Lua API Hyprland (hyprctl eval), как у встроенных
-  // плагинов: bindings.lua править не нужно. Ручка бинда хранится в Lua, поэтому
-  // снимается ровно этот бинд. Метка владельца не даёт старому экземпляру при
-  // перезапуске оболочки снять бинд, который уже поставил новый.
-  property string boundHotkey: ""
+  // Бинды создаются через Lua API Hyprland (hyprctl eval), как у встроенных
+  // плагинов: bindings.lua править не нужно. Ручки биндов хранятся в Lua, поэтому
+  // снимаются ровно эти бинды. Метка владельца не даёт старому экземпляру при
+  // перезапуске оболочки снять бинды, которые уже поставил новый.
+  //   hotkey        — весь экран (SIGUSR1)
+  //   region_hotkey — выделить область мышью (SIGRTMIN+1)
+  property string boundKeys: ""
   readonly property string _owner: String(Date.now()) + "-" + String(Math.floor(Math.random() * 1e9))
   readonly property string _unbindLua:
-    "if _G.quizhint_bind then pcall(function() _G.quizhint_bind:unbind() end) _G.quizhint_bind = nil end"
+    "for _, k in ipairs({'quizhint_bind', 'quizhint_region_bind'}) do "
+    + "if _G[k] then pcall(function() _G[k]:unbind() end) _G[k] = nil end end"
   readonly property string _releaseLua:
     "if _G.quizhint_owner == \"" + _owner + "\" then " + _unbindLua + " _G.quizhint_owner = nil end"
 
-  function bindHotkey(keys) {
-    var spec = String(keys || "").trim()
+  function bindLua(name, spec, command, description) {
+    return " do local ok, e = pcall(function() _G." + name + " = hl.bind(\"" + spec + "\", hl.dsp.exec_cmd(\""
+      + command + "\"), { description = \"" + description + "\" }) end)"
+      + " if not ok then errs[#errs + 1] = \"" + spec + " → \" .. tostring(e) end end"
+  }
+
+  function bindHotkeys() {
+    var main = hotkey.trim()
+    var region = regionHotkey.trim()
     if (bindProc.running) {
-      _bindQueued = spec
       _bindPending = true
       return
     }
-    if (spec !== "" && !/^[A-Za-z0-9_+: ]+$/.test(spec)) {
-      hotkeyError = "Недопустимое сочетание: " + spec
-      return
+    var problems = []
+    var valid = /^[A-Za-z0-9_+: ]*$/
+    if (!valid.test(main)) { problems.push("недопустимое сочетание: " + main); main = "" }
+    if (!valid.test(region)) { problems.push("недопустимое сочетание: " + region); region = "" }
+    if (region !== "" && region.toUpperCase() === main.toUpperCase()) {
+      problems.push("клавиши снимка и выделения совпадают")
+      region = ""
     }
-    var lua = _unbindLua + " _G.quizhint_owner = \"" + _owner + "\""
-    if (spec !== "")
-      lua += " _G.quizhint_bind = hl.bind(\"" + spec + "\", hl.dsp.exec_cmd(\"pkill -USR1 -x quizhint\"),"
-        + " { description = \"Quiz Hint: спросить\" })"
-    bindProc.spec = spec
+    var lua = _unbindLua + " _G.quizhint_owner = \"" + _owner + "\" local errs = {}"
+    if (main !== "") lua += bindLua("quizhint_bind", main, "pkill -USR1 -x quizhint", "Quiz Hint: спросить")
+    if (region !== "") lua += bindLua("quizhint_region_bind", region, "pkill -RTMIN+1 -x quizhint", "Quiz Hint: выделить область")
+    lua += " if #errs > 0 then error(table.concat(errs, \"; \")) end"
+    bindProc.keys = hotkey + "|" + regionHotkey
+    bindProc.problems = problems
     bindProc.command = ["hyprctl", "eval", lua]
     bindProc.running = true
   }
 
   Process {
     id: bindProc
-    property string spec: ""
+    property string keys: ""
+    property var problems: []
     stdout: StdioCollector { id: bindOut; waitForEnd: true }
     stderr: StdioCollector { id: bindErr; waitForEnd: true }
     onExited: function(code) {
-      if (code === 0) {
-        root.boundHotkey = bindProc.spec
-        root.hotkeyError = ""
-      } else {
+      var problems = bindProc.problems.slice()
+      if (code !== 0) {
         var text = (String(bindOut.text || "") + " " + String(bindErr.text || "")).trim()
-        var match = text.match(/failed to parse key string: (.*)$/m)
-        root.hotkeyError = "Сочетание не принято: " + (match ? match[1] : (text || "код " + code))
+        var re = /([^;:\]]+?) → [^;]*?failed to parse key string: ([^;\n]*)/g
+        var found = false
+        for (var m = re.exec(text); m; m = re.exec(text)) {
+          problems.push("«" + m[1].trim() + "» не принята (" + m[2].trim() + ")")
+          found = true
+        }
+        if (!found) problems.push("Hyprland не принял клавиши: " + (text || "код " + code))
       }
+      root.boundKeys = bindProc.keys
+      root.hotkeyError = problems.length > 0 ? "Клавиша: " + problems.join("; ") : ""
       if (root._bindPending) {
         root._bindPending = false
-        root.bindHotkey(root._bindQueued)
+        root.bindHotkeys()
       }
     }
   }
@@ -428,7 +482,7 @@ Item {
   Connections {
     target: Hyprland
     function onRawEvent(event) {
-      if (event && event.name === "configreloaded") root.bindHotkey(root.hotkey)
+      if (event && event.name === "configreloaded") root.bindHotkeys()
     }
   }
 

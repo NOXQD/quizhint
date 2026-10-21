@@ -7,7 +7,7 @@ CXX        ?= g++
 CC         ?= cc
 PKG_CONFIG ?= pkg-config
 
-PKGS := wayland-client cairo libcurl libturbojpeg
+PKGS := wayland-client cairo pangocairo libcurl libturbojpeg
 
 WAYLAND_PROTOCOLS := $(shell $(PKG_CONFIG) --variable=pkgdatadir wayland-protocols)
 WAYLAND_SCANNER   := $(shell $(PKG_CONFIG) --variable=wayland_scanner wayland-scanner)

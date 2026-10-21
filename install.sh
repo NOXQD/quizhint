@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 say() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 
 # Зависимости для сборки (Arch / Omarchy).
-deps=(base-devel wayland wayland-protocols cairo curl libjpeg-turbo inotify-tools)
+deps=(base-devel wayland wayland-protocols cairo pango curl libjpeg-turbo inotify-tools slurp wl-clipboard)
 if command -v pacman >/dev/null; then
   missing=()
   for p in "${deps[@]}"; do pacman -Qq "$p" >/dev/null 2>&1 || pacman -Qqg "$p" >/dev/null 2>&1 || missing+=("$p"); done
@@ -18,7 +18,7 @@ if command -v pacman >/dev/null; then
   fi
 else
   say "Не Arch: убедитесь, что установлены компилятор C++, make, pkg-config, wayland-scanner,"
-  say "заголовки wayland-client, wayland-protocols, cairo, libcurl, libturbojpeg и inotify-tools."
+  say "заголовки wayland-client, wayland-protocols, cairo, pango, libcurl, libturbojpeg, а также inotify-tools и slurp."
 fi
 
 say "Сборка"

@@ -18,13 +18,18 @@ struct wp_fractional_scale_v1;
 struct wp_fractional_scale_v1_listener;
 struct wp_viewport;
 
-// Маленькая плашка с текстом в левом верхнем углу монитора: слой overlay
-// (поверх всех окон, включая полноэкранные), без фокуса клавиатуры, клики
-// проходят насквозь. Поверхность живёт всё время и в спрятанном виде просто
-// прозрачна — так нет анимаций появления, и смена цифры мгновенная.
+// Маленькая плашка в левом верхнем углу монитора: слой overlay (поверх всех
+// окон, включая полноэкранные), без фокуса клавиатуры, клики проходят насквозь.
+// Поверхность живёт всё время и в спрятанном виде просто прозрачна — так нет
+// анимаций появления, и смена цифры мгновенная.
+//
+// Два вида: Badge — цифра в маленькой плашке, Text — блок текста с переносом
+// строк (полный ответ). Под текст размер поверхности меняется.
 class Overlay {
 public:
     static constexpr const char* kBusy = "\x01";  // индикатор «модель думает»
+
+    enum class Kind { Badge, Text };
 
     Overlay(Display& display, const Config& cfg);
     ~Overlay();
@@ -37,7 +42,7 @@ public:
     void output_removed(Output* output);
 
     // Показать текст; пустая строка — спрятать.
-    void set(const std::string& text);
+    void set(const std::string& text, Kind kind = Kind::Badge);
     // Спрятать и вызвать presented, когда композитор отрисует кадр без плашки.
     void hide(std::function<void()> presented);
     bool shown() const { return !text_.empty(); }
@@ -53,7 +58,10 @@ private:
     void destroy();
     void redraw();
     void paint(cairo_t* cr) const;
-    std::pair<uint32_t, uint32_t> surface_size() const;
+    void paint_text(cairo_t* cr) const;
+    std::pair<uint32_t, uint32_t> badge_size() const;
+    std::pair<uint32_t, uint32_t> text_size() const;
+    std::pair<uint32_t, uint32_t> desired_size() const;
     void on_configure(uint32_t serial, uint32_t width, uint32_t height);
 
     Display& d_;
@@ -66,9 +74,11 @@ private:
     wl_callback* frame_callback_ = nullptr;
     std::function<void()> frame_done_;
     bool configured_ = false;
-    uint32_t width_ = 0, height_ = 0;  // логический размер поверхности
+    uint32_t width_ = 0, height_ = 0;  // логический размер поверхности (из configure)
+    uint32_t req_w_ = 0, req_h_ = 0;   // запрошенный размер (set_size)
     int32_t buffer_scale_ = 1;         // целый масштаб (без wp_viewporter)
     double fractional_scale_ = 0;      // дробный масштаб из wp_fractional_scale, 0 — ещё не пришёл
     std::string text_;
+    Kind kind_ = Kind::Badge;
     std::vector<std::unique_ptr<ShmBuffer>> buffers_;  // ещё не отпущенные композитором
 };
